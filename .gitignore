@@ -1,0 +1,25 @@
+# 敏感信息
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 数据文件（运行时生成）
+data/*.json
+data/*.csv
+
+# 第三方工具（需单独克隆）
+tools/MediaCrawler/
+
+# macOS
+.DS_Store
+*.swp
+
+# IDE
+.idea/
+.vscode/
