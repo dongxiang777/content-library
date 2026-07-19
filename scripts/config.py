@@ -50,6 +50,12 @@ LLM_BASE_URL = _os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1")
 LLM_API_KEY = _os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = _os.environ.get("LLM_MODEL", "deepseek-chat")
 
+# ===== Pipeline 并行度 =====
+# prepare（下载+ffmpeg）预取条数 / 线程数；FunASR 仍串行（daemon 单通道）
+PREPARE_WORKERS = int(_os.environ.get("PREPARE_WORKERS", "2"))
+# AI 分类等 I/O 线程数（飞书 append 在 pipeline 侧串行，保证行序）
+IO_WORKERS = int(_os.environ.get("IO_WORKERS", "2"))
+
 # ===== 搜索关键词 (按业务线) =====
 SEARCH_KEYWORDS = {
     "传承": [
