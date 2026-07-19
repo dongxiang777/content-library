@@ -162,14 +162,25 @@ def cmd_import(args):
     last_row = get_last_row()
     print(f"[导入] 飞书表格当前最后一行: {last_row}")
 
+    # 去重：跳过已导入的 aweme_id
+    existing_ids = set(state.get("items", {}).keys())
+    new_items = [item for item in items
+                 if item.get("aweme_id") not in existing_ids]
+    skipped = len(items) - len(new_items)
+    if skipped:
+        print(f"[导入] 跳过 {skipped} 条重复数据")
+    if not new_items:
+        print("[导入] 没有新数据需要导入")
+        return state
+
     # 批量追加
-    rows = [crawled_item_to_row(item) for item in items]
+    rows = [crawled_item_to_row(item) for item in new_items]
     resp = append_rows(SPREADSHEET_TOKEN, SHEET_ID, rows)
     start_row = last_row + 1
     print(f"[导入] 追加成功: 行 {start_row} ~ {start_row + len(rows) - 1}")
 
     # 记录状态 (aweme_id → 飞书行号)
-    for i, item in enumerate(items):
+    for i, item in enumerate(new_items):
         aweme_id = item.get("aweme_id", f"unknown_{i}")
         state["items"][aweme_id] = {
             "row": start_row + i,
@@ -230,18 +241,30 @@ def cmd_process(args):
             try:
                 vr = process_video(video_url)
                 transcript = vr.get("transcript", "")
+                # 清理 FunASR 版本号前缀
+                for prefix in ["funasr version: 1.3.16.", "funasr version:", "FunASR version:"]:
+                    if transcript.startswith(prefix):
+                        transcript = transcript[len(prefix):].lstrip("\n ")
+                        break
                 if transcript:
                     field_values[IDX_TRANSCRIPT] = transcript
                     info["transcript"] = transcript
                     print(f"[处理] 转写完成: {len(transcript)}字")
                 else:
-                    print("[处理] 转写无结果，跳过")
+                    print("[处理] 转写无结果，跳过本条")
             except Exception as e:
                 print(f"[处理] 转写失败: {e}")
                 transcript = ""
         else:
             transcript = info["transcript"]
             print(f"[处理] 已有转写 ({len(transcript)}字)")
+
+        # 没有文案就不分类，避免凭空瞎写
+        if not transcript:
+            print("[处理] 无文案，不分类、不标记完成，等待重试")
+            save_state(state, args.state)
+            time.sleep(1)
+            continue
 
         # Step 2: AI 分类
         if not info.get("classified"):
