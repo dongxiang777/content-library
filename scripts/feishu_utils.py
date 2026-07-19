@@ -225,30 +225,39 @@ def write_row_fields(token: str, sheet_id: str, row_num: int,
     写入某一行的指定字段。
     field_values: {列名(str): 值}，按列名定位，不依赖硬编码索引。
     col_map: get_column_map() 的返回值。
+
+    只写入 field_values 里显式给出的列；不相邻字段拆成多段写入，
+    避免用空字符串覆盖区间内其它已有单元格（如只补「平台」时误清「原始链接」）。
     """
     if not field_values:
         return {}
 
-    num_cols = max(col_map.values()) + 1
-    row = [""] * num_cols
-
+    # [(col_idx, value), ...] 仅保留映射得到的字段
+    cells = []
     for field_name, value in field_values.items():
         idx = col_map.get(field_name)
         if idx is not None:
-            row[idx] = value
-
-    non_empty = [i for i, v in enumerate(row) if v]
-    if not non_empty:
+            cells.append((idx, value))
+    if not cells:
         return {}
 
-    start = min(non_empty)
-    end = max(non_empty)
-    start_col = _col_letter(start)
-    end_col = _col_letter(end)
-    range_str = f"{start_col}{row_num}:{end_col}{row_num}"
-    vals = [row[start:end + 1]]
+    cells.sort(key=lambda x: x[0])
 
-    return write_cells(token, sheet_id, range_str, vals)
+    # 合并连续列区间，逐段 PUT
+    last_result = {}
+    i = 0
+    while i < len(cells):
+        j = i
+        while j + 1 < len(cells) and cells[j + 1][0] == cells[j][0] + 1:
+            j += 1
+        start_idx = cells[i][0]
+        end_idx = cells[j][0]
+        segment = [cells[k][1] for k in range(i, j + 1)]
+        range_str = f"{_col_letter(start_idx)}{row_num}:{_col_letter(end_idx)}{row_num}"
+        last_result = write_cells(token, sheet_id, range_str, [segment])
+        i = j + 1
+
+    return last_result
 
 
 if __name__ == "__main__":

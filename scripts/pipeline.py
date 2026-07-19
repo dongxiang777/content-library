@@ -9,17 +9,27 @@
     python pipeline.py process [--limit N]                # 重试无文案的行
     python pipeline.py crawl --type creator --creator-id "MS4wLjABAAA..."
     python pipeline.py transcribe --url "https://..."
+    python pipeline.py cleanup                            # 清理 /tmp/dy_* 临时文件
 
 性能：流水线并行
   - 下载/ffmpeg 预取下一条，与当前 FunASR 转写重叠
   - AI 分类与下一条的 prepare/转写重叠
   - 飞书写入与分类拆分，写入串行保序；分类异步
   - 启动时并行：FunASR warmup + 飞书列映射/末行
+  - 启动时清理上次残留的 /tmp/dy_* 临时文件
+
+注意（昵称遮蔽历史限制）:
+  早期 MediaCrawler store/douyin 的 mask_nickname() 会把昵称中间字换成星号
+  （如"小***师"）。代码侧已移除 mask，但历史 JSON 里仍是星号昵称。
+  现有数据只能保持星号；下次重新爬取同一视频/创作者后，import 会用完整
+  昵称回写飞书「创作者」列并更新 pipeline_state。
 """
 
 import argparse
+import glob
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -39,6 +49,81 @@ from config import (
 from feishu_utils import (
     append_rows, write_row_fields, get_last_row, get_column_map, _col_letter,
 )
+
+
+# ==================== Ctrl+C 保护（二次确认才退出） ====================
+# 必须在 FunASR daemon 子进程启动之前注册，否则子进程也可能收到 SIGINT。
+
+_interrupt_count = 0
+_interrupt_requested = False  # 主循环可检查此 flag 做优雅退出
+
+
+def _sigint_handler(sig, frame):
+    """第一次 Ctrl+C 提示；第二次强制退出。忽略单纯的 SIGINT 误触。"""
+    global _interrupt_count, _interrupt_requested
+    _interrupt_count += 1
+    if _interrupt_count == 1:
+        _interrupt_requested = True
+        print("\n[提示] 收到 Ctrl+C。pipeline 不会立即中断；"
+              "再按一次强制退出（可能导致转写中断、临时文件残留）。",
+              flush=True)
+    else:
+        print("\n[强制退出]", flush=True)
+        # 用 os._exit 避免卡在线程池/daemon 清理上
+        os._exit(130)
+
+
+def _install_sigint_guard():
+    """注册 SIGINT 保护。SIGINT 二次确认；SIGTERM 仍立即退出（系统停机）。"""
+    try:
+        signal.signal(signal.SIGINT, _sigint_handler)
+    except (ValueError, OSError) as e:
+        # 非主线程或环境不支持时忽略
+        print(f"[警告] 无法注册 SIGINT handler: {e}")
+
+
+def _check_interrupt(where: str = "") -> bool:
+    """若用户已请求中断，打印位置并返回 True。"""
+    if _interrupt_requested:
+        loc = f" ({where})" if where else ""
+        print(f"[中断] 安全停止点{loc}，结束后续处理")
+        return True
+    return False
+
+
+# ==================== /tmp 临时文件清理 ====================
+
+TMP_DY_GLOB = "/tmp/dy_*"
+
+
+def cleanup_tmp_dy_files(verbose: bool = True) -> dict:
+    """
+    清理 /tmp/dy_* 临时文件（pipeline 下载的 mp4 + ffmpeg 抽出的 wav）。
+    返回 {"count": N, "bytes": total_size}。
+    """
+    paths = glob.glob(TMP_DY_GLOB)
+    total = 0
+    removed = 0
+    for p in paths:
+        try:
+            sz = os.path.getsize(p) if os.path.isfile(p) else 0
+            os.remove(p)
+            total += sz
+            removed += 1
+        except OSError as e:
+            if verbose:
+                print(f"[清理] 删除失败 {p}: {e}")
+    if verbose:
+        mb = total / (1024 * 1024)
+        print(f"[清理] 删除 {removed} 个 /tmp/dy_* 文件 ({mb:.1f} MB)")
+    return {"count": removed, "bytes": total}
+
+
+def cmd_cleanup(args):
+    """手动清理所有 /tmp/dy_* 临时文件。"""
+    result = cleanup_tmp_dy_files(verbose=True)
+    if result["count"] == 0:
+        print("[清理] 没有需要清理的临时文件")
 
 
 # ==================== 状态管理 ====================
@@ -63,6 +148,167 @@ def save_state(state: dict, path: str):
 
 
 DEFAULT_STATE = f"{DATA_DIR}/pipeline_state.json"
+CRAWL_JSON_DIR = f"{MEDIACRAWLER_DIR}/data/douyin/json"
+
+
+# ==================== 昵称工具 ====================
+#
+# 历史限制：早期爬取时 MediaCrawler 的 mask_nickname() 会把昵称中间字换成 '*'
+# （如"小***师"）。代码侧已移除 mask，但历史 JSON / 飞书行仍是星号。
+# 现有被遮蔽的数据只能等下次重新爬取拿到完整昵称后再回写更新。
+
+def _nickname_is_better(new: str, old: str) -> bool:
+    """判断 new 是否比 old 更完整（优先无星号遮蔽的昵称）。"""
+    new = (new or "").strip()
+    old = (old or "").strip()
+    if not new:
+        return False
+    if not old:
+        return True
+    new_masked = "*" in new
+    old_masked = "*" in old
+    if old_masked and not new_masked:
+        return True
+    if new_masked and not old_masked:
+        return False
+    # 两边都无星号且不同 → 视为改名，用新值
+    if not new_masked and new != old:
+        return True
+    return False
+
+
+def load_nickname_index(json_dir: str = CRAWL_JSON_DIR) -> dict:
+    """
+    从 MediaCrawler 输出 JSON 按 aweme_id 建昵称索引。
+    同一 aweme_id 出现多次时，优先保留更完整（无星号）的昵称。
+    返回 {aweme_id: {"nickname": str, "creator_hash": str}}
+    """
+    index = {}
+    path = Path(json_dir)
+    if not path.is_dir():
+        return index
+    for fp in sorted(path.glob("*.json"), key=os.path.getmtime):
+        try:
+            with open(fp) as f:
+                items = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[警告] 读取爬取 JSON 失败 {fp.name}: {e}")
+            continue
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            aweme_id = it.get("aweme_id")
+            if not aweme_id:
+                continue
+            nick = (it.get("nickname") or "").strip()
+            chash = (it.get("creator_hash") or "").strip()
+            prev = index.get(aweme_id)
+            if prev is None or _nickname_is_better(nick, prev.get("nickname", "")):
+                index[aweme_id] = {"nickname": nick, "creator_hash": chash}
+            elif chash and not prev.get("creator_hash"):
+                prev["creator_hash"] = chash
+    return index
+
+
+def backfill_state_nicknames(state: dict, json_dir: str = CRAWL_JSON_DIR) -> int:
+    """
+    给 pipeline_state 每个 item 补全 nickname / creator_hash 字段。
+    从原始爬取 JSON 按 aweme_id 匹配；历史数据可能仍是星号遮蔽昵称。
+    返回更新条数。
+    """
+    index = load_nickname_index(json_dir)
+    updated = 0
+    for aweme_id, info in state.get("items", {}).items():
+        meta = index.get(aweme_id)
+        if not meta:
+            # 至少保证字段存在，便于后续结构一致
+            if "nickname" not in info:
+                info["nickname"] = ""
+                updated += 1
+            continue
+        changed = False
+        new_nick = meta.get("nickname", "")
+        if _nickname_is_better(new_nick, info.get("nickname", "")) or "nickname" not in info:
+            if info.get("nickname") != new_nick:
+                info["nickname"] = new_nick
+                changed = True
+            elif "nickname" not in info:
+                info["nickname"] = new_nick
+                changed = True
+        if meta.get("creator_hash") and info.get("creator_hash") != meta["creator_hash"]:
+            info["creator_hash"] = meta["creator_hash"]
+            changed = True
+        if changed:
+            updated += 1
+    return updated
+
+
+def refresh_nicknames_from_items(items: list, state: dict, col_map: dict = None,
+                                 write_feishu: bool = True) -> int:
+    """
+    用新爬取数据中的完整昵称，回写更新 state + 飞书旧行的「创作者」字段。
+
+    场景：历史数据被 mask 成"小***师"，下次重新爬取同一视频/创作者后
+    nickname 变为完整值，此处按 aweme_id（及同 creator_hash）更新。
+
+    限制：若新 JSON 里仍是星号昵称，则无法改善，只能等真正拿到完整昵称。
+    """
+    if not items:
+        return 0
+
+    # 1) 按 aweme_id / creator_hash 收集更优昵称
+    better_by_id = {}
+    better_by_hash = {}
+    for it in items:
+        aweme_id = it.get("aweme_id")
+        nick = (it.get("nickname") or "").strip()
+        chash = (it.get("creator_hash") or "").strip()
+        if not nick:
+            continue
+        if aweme_id:
+            old = better_by_id.get(aweme_id, "")
+            if _nickname_is_better(nick, old):
+                better_by_id[aweme_id] = nick
+        # 只有无星号的完整昵称才用于同创作者批量回写
+        if chash and "*" not in nick:
+            better_by_hash[chash] = nick
+
+    if not better_by_id and not better_by_hash:
+        return 0
+
+    updated = 0
+    for aweme_id, info in state.get("items", {}).items():
+        old_nick = info.get("nickname", "")
+        new_nick = better_by_id.get(aweme_id, "")
+        if not new_nick:
+            chash = info.get("creator_hash", "")
+            if chash and chash in better_by_hash:
+                new_nick = better_by_hash[chash]
+        if not _nickname_is_better(new_nick, old_nick):
+            continue
+
+        info["nickname"] = new_nick
+        # 同步 creator_hash（若新数据有）
+        for it in items:
+            if it.get("aweme_id") == aweme_id and it.get("creator_hash"):
+                info["creator_hash"] = it["creator_hash"]
+                break
+
+        row_num = info.get("row") or 0
+        if write_feishu and row_num and col_map and "创作者" in col_map:
+            try:
+                write_row_fields(
+                    SPREADSHEET_TOKEN, SHEET_ID, row_num,
+                    {"创作者": new_nick}, col_map,
+                )
+                print(f"[昵称] 行{row_num} 创作者已更新: {old_nick!r} → {new_nick!r}")
+            except Exception as e:
+                print(f"[昵称] 行{row_num} 回写失败: {e}")
+        else:
+            print(f"[昵称] state {aweme_id} 更新: {old_nick!r} → {new_nick!r}")
+        updated += 1
+
+    return updated
 
 
 # ==================== 行数据构建 (按列名，不依赖位置) ====================
@@ -174,8 +420,13 @@ def _warmup_resources():
     """
     并行预热：FunASR 模型加载 + 飞书列映射 + 末行。
     原先串行约 15s(模型)+2s(飞书)，现在约 max(15, 2)。
+
+    启动时先清理上次异常退出残留的 /tmp/dy_* 临时文件。
     """
     from transcribe import ensure_daemon
+
+    # 异常退出残留的 mp4/wav 可能占数 GB，预热前先清掉
+    cleanup_tmp_dy_files(verbose=True)
 
     col_map_holder = {}
     last_row_holder = {"v": 0}
@@ -293,11 +544,16 @@ def _run_import_pipeline(new_items: list, state: dict, state_path: str,
             print(f"[写入] 行{row_hint} 写入失败: {e}")
 
         with state_lock:
+            # nickname 可能仍是历史 mask 星号（见模块注释）；结构上必须写入，
+            # 待下次重新爬取拿到完整昵称后再由 refresh_nicknames_from_items 回写。
             state["items"][aweme_id] = {
                 "row": row_hint if write_ok else 0,
                 "video_url": video_url,
                 "title": raw_title,
                 "desc": item.get("desc", ""),
+                "nickname": item.get("nickname", "") or "",
+                "creator_hash": item.get("creator_hash", "") or "",
+                "platform": item.get("platform", "抖音") or "抖音",
                 "transcript": transcript,
                 "classified": classification is not None,
                 "processed": write_ok and bool(transcript),
@@ -315,6 +571,9 @@ def _run_import_pipeline(new_items: list, state: dict, state_path: str,
 
     try:
         for i, item in enumerate(new_items):
+            if _check_interrupt(f"import {i}/{n}"):
+                break
+
             aweme_id = item.get("aweme_id") or f"unknown_{i}"
             raw_title = item.get("title", "") or item.get("desc", "")
             clean_title, hashtags = extract_hashtags(raw_title)
@@ -450,8 +709,9 @@ def cmd_import(args):
     """
     导入流程：
     1. 读取采集 JSON，去重
-    2. 流水线：下载/ffmpeg ∥ FunASR 转写 ∥ AI分类 ∥ 飞书写入
-    3. 逐条写入飞书（不攒批），每条写完原子更新状态
+    2. 对已存在条目：用新爬取的完整昵称回写飞书「创作者」（若比旧值更好）
+    3. 流水线：下载/ffmpeg ∥ FunASR 转写 ∥ AI分类 ∥ 飞书写入
+    4. 逐条写入飞书（不攒批），每条写完原子更新状态（含 nickname）
     """
     with open(args.file) as f:
         items = json.load(f)
@@ -460,17 +720,26 @@ def cmd_import(args):
 
     state = load_state(args.state)
 
-    # 并行预热 daemon + 飞书元数据
+    # 并行预热 daemon + 飞书元数据（含清理残留临时文件）
     col_map, last_row = _warmup_resources()
     print(f"[导入] 飞书列映射: {len(col_map)}列")
     print(f"[导入] 当前最后一行: {last_row}")
+
+    # 即使全部是重复数据，也尝试用新昵称回写旧行
+    # （历史 mask 星号 → 重新爬取后的完整昵称）
+    nick_updated = refresh_nicknames_from_items(
+        items, state, col_map=col_map, write_feishu=True
+    )
+    if nick_updated:
+        save_state(state, args.state)
+        print(f"[导入] 已用新昵称回写 {nick_updated} 条旧数据")
 
     # 去重
     existing_ids = set(state.get("items", {}).keys())
     new_items = [it for it in items if it.get("aweme_id") not in existing_ids]
     skipped = len(items) - len(new_items)
     if skipped:
-        print(f"[导入] 跳过 {skipped} 条重复数据")
+        print(f"[导入] 跳过 {skipped} 条重复数据（已尝试昵称回写）")
     if not new_items:
         print("[导入] 没有新数据")
         return state
@@ -500,6 +769,9 @@ def cmd_process(args):
 
     from transcribe import ensure_daemon, prepare_audio, transcribe, stop_daemon, cleanup_paths
     from ai_classify import classify_item
+
+    # 清理上次异常退出残留的临时文件
+    cleanup_tmp_dy_files(verbose=True)
 
     # 并行：daemon + col_map
     col_map_holder = {}
@@ -585,9 +857,17 @@ def cmd_process(args):
 
     def do_post(aweme_id, info, transcript, clean_title, hashtags, field_base):
         field_values = dict(field_base)
+        # 平台字段：build_row_data 默认写「抖音」，但 process 路径手写 field_values
+        # 时曾遗漏，导致部分行（如 115-122）平台为空。此处强制补上。
+        field_values["平台"] = info.get("platform") or "抖音"
         if transcript:
             field_values["文案全文"] = transcript
             info["transcript"] = transcript
+
+        # 若 state 里已有更完整昵称，一并回写创作者列
+        nick = (info.get("nickname") or "").strip()
+        if nick:
+            field_values["创作者"] = nick
 
         if transcript and not info.get("classified"):
             try:
@@ -618,11 +898,15 @@ def cmd_process(args):
                 return False
 
         info["processed"] = bool(transcript)
+        info["platform"] = field_values.get("平台", "抖音")
         save_state(state, args.state)
         return True
 
     try:
         for idx, (aweme_id, info) in enumerate(pending_list):
+            if _check_interrupt(f"process {idx}/{len(pending_list)}"):
+                break
+
             count += 1
             row_num = info["row"]
             video_url = info["video_url"]
@@ -761,6 +1045,9 @@ def cmd_transcribe(args):
 # ==================== 入口 ====================
 
 def main():
+    # 尽早注册 SIGINT 保护（须在 FunASR daemon 启动前），避免误触 Ctrl+C 杀进程
+    _install_sigint_guard()
+
     parser = argparse.ArgumentParser(
         description="爆款内容库 Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -772,6 +1059,7 @@ def main():
   %(prog)s process --limit 5
   %(prog)s crawl --type creator --creator-id "MS4wLjABAAA..."
   %(prog)s transcribe --url "https://..."
+  %(prog)s cleanup
         """
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -801,6 +1089,8 @@ def main():
     p_trans = sub.add_parser("transcribe", help="单独转写一个视频")
     p_trans.add_argument("--url", required=True, help="视频下载 URL")
 
+    sub.add_parser("cleanup", help="清理 /tmp/dy_* 临时文件（mp4/wav）")
+
     args = parser.parse_args()
     Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -810,6 +1100,7 @@ def main():
         "process": cmd_process,
         "full": cmd_full,
         "transcribe": cmd_transcribe,
+        "cleanup": cmd_cleanup,
     }
     cmds[args.command](args)
 

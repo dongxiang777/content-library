@@ -264,7 +264,12 @@ def extract_audio(video_path: str, audio_path: str) -> bool:
 
 
 def cleanup_paths(paths):
-    """删除临时文件，忽略错误。可公开调用。"""
+    """
+    删除临时文件，忽略错误。可公开调用。
+    应同时覆盖 mp4（下载视频）和 wav（ffmpeg 抽音频）；
+    prepare_audio 成功时会先删 mp4，cleanup 列表通常仍含两者（mp4 已不存在则 no-op），
+    失败路径 / 异常退出时也能双清。
+    """
     for f in paths:
         if not f:
             continue
@@ -278,7 +283,6 @@ def cleanup_paths(paths):
 # 兼容内部旧名
 _cleanup_paths = cleanup_paths
 
-
 def prepare_audio(url: str, work_dir: str = "/tmp") -> dict:
     """
     下载视频并提取音频（I/O 阶段，可与 FunASR 转写并行）。
@@ -286,16 +290,19 @@ def prepare_audio(url: str, work_dir: str = "/tmp") -> dict:
       {
         "ok": bool,
         "audio_path": str|None,
-        "cleanup": [paths...],   # 调用方转写后负责清理
+        "cleanup": [paths...],   # 调用方转写后负责清理（含 wav；mp4 通常已删）
         "error": str|None,
       }
     视频文件在抽完音频后立即删除，只保留 wav，减少磁盘占用。
+    转写完成后调用方必须 cleanup_paths(cleanup)；pipeline 启动时也会
+    清扫 /tmp/dy_* 残留（异常退出时的 mp4/wav）。
     """
-    video_id = hashlib.md5(url.encode()).hexdigest()
+    video_id = hashlib.md5(url.encode()).hexdigest()[:12]
     # 用线程 id 防并发准备同一 URL 时路径冲突
     tid = threading.get_ident() % 100000
     video_path = f"{work_dir}/dy_{video_id}_{tid}.mp4"
     audio_path = f"{work_dir}/dy_{video_id}_{tid}.wav"
+    # 始终把 mp4+wav 都放进 cleanup，保证异常路径也能双清
     cleanup = [video_path, audio_path]
 
     if not url:
@@ -310,7 +317,7 @@ def prepare_audio(url: str, work_dir: str = "/tmp") -> dict:
             _cleanup_paths(cleanup)
             return {"ok": False, "audio_path": None, "cleanup": [], "error": "ffmpeg failed"}
 
-        # 抽完即删视频，只留音频给转写
+        # 抽完即删视频，只留音频给转写；cleanup 仍保留 video_path（已不存在则 no-op）
         _cleanup_paths([video_path])
 
         if not Path(audio_path).exists():
@@ -321,7 +328,8 @@ def prepare_audio(url: str, work_dir: str = "/tmp") -> dict:
         return {
             "ok": True,
             "audio_path": audio_path,
-            "cleanup": [audio_path],
+            # 同时返回 mp4+wav：mp4 多半已删，wav 由调用方在转写后删除
+            "cleanup": cleanup,
             "error": None,
         }
     except Exception as e:
