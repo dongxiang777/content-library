@@ -6,7 +6,7 @@
 SPREADSHEET_TOKEN = "RwZFsg8klhpzWVtHrpUcnguAn4g"
 SHEET_ID = "3a6f67"
 
-# 19列字段定义 (A-S)
+# 19列字段定义 (A-S) — 与飞书表格实际列顺序一致
 FIELDS = [
     "业务方向",     # A (0)
     "细分领域",     # B (1)
@@ -19,14 +19,14 @@ FIELDS = [
     "文案全文",     # I (8)
     "标题",         # J (9)
     "平台",         # K (10)
-    "原始链接",     # L (11)
-    "创作者",       # M (12)
-    "点赞",         # N (13)
-    "收藏",         # O (14)
-    "转发",         # P (15)
-    "评论",         # Q (16)
-    "入库日期",     # R (17)
-    "原视频标签",   # S (18)
+    "原视频标签",   # L (11)
+    "原始链接",     # M (12)
+    "创作者",       # N (13)
+    "点赞",         # O (14)
+    "收藏",         # P (15)
+    "转发",         # Q (16)
+    "评论",         # R (17)
+    "入库日期",     # S (18)
 ]
 
 # 字段索引快捷引用
@@ -41,14 +41,14 @@ IDX_TAGS = 7      # 特征标签
 IDX_TRANSCRIPT = 8  # 文案全文
 IDX_TITLE = 9     # 标题
 IDX_PLATFORM = 10 # 平台
-IDX_URL = 11      # 原始链接
-IDX_CREATOR = 12  # 创作者
-IDX_LIKES = 13    # 点赞
-IDX_COLLECTS = 14 # 收藏
-IDX_SHARES = 15   # 转发
-IDX_COMMENTS = 16 # 评论
-IDX_DATE = 17     # 入库日期
-IDX_HASHTAGS = 18 # 原视频标签
+IDX_HASHTAGS = 11 # 原视频标签
+IDX_URL = 12      # 原始链接
+IDX_CREATOR = 13  # 创作者
+IDX_LIKES = 14    # 点赞
+IDX_COLLECTS = 15 # 收藏
+IDX_SHARES = 16   # 转发
+IDX_COMMENTS = 17 # 评论
+IDX_DATE = 18     # 入库日期
 
 # ===== 标签提取工具 =====
 import re
