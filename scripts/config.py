@@ -6,7 +6,7 @@
 SPREADSHEET_TOKEN = "RwZFsg8klhpzWVtHrpUcnguAn4g"
 SHEET_ID = "3a6f67"
 
-# 18列字段定义 (A-R)
+# 19列字段定义 (A-S)
 FIELDS = [
     "业务方向",     # A (0)
     "细分领域",     # B (1)
@@ -26,6 +26,7 @@ FIELDS = [
     "转发",         # P (15)
     "评论",         # Q (16)
     "入库日期",     # R (17)
+    "原视频标签",   # S (18)
 ]
 
 # 字段索引快捷引用
@@ -47,6 +48,22 @@ IDX_COLLECTS = 14 # 收藏
 IDX_SHARES = 15   # 转发
 IDX_COMMENTS = 16 # 评论
 IDX_DATE = 17     # 入库日期
+IDX_HASHTAGS = 18 # 原视频标签
+
+# ===== 标签提取工具 =====
+import re
+
+def extract_hashtags(text: str) -> tuple:
+    """从标题/描述中提取 #标签，返回 (清理后的文本, 标签列表)。
+    支持抖音和视频号格式：#标签 #标签 #标签#标签
+    """
+    if not text:
+        return "", []
+    # 匹配 # 后跟非空白字符（到下一个 # 或空格或字符串结尾）
+    tags = re.findall(r'#([^\s#]+)', text)
+    # 从文本中移除标签部分
+    cleaned = re.sub(r'\s*#[^\s#]+', '', text).strip()
+    return cleaned, tags
 
 # ===== MediaCrawler =====
 MEDIACRAWLER_DIR = "/Users/shaoxinjiang/CodexWorkspace/projects/content library/tools/MediaCrawler"

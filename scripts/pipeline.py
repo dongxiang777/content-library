@@ -47,6 +47,7 @@ from config import (
     IDX_AUDIENCE, IDX_EMOTION, IDX_TAGS, IDX_TRANSCRIPT,
     IDX_TITLE, IDX_PLATFORM, IDX_URL, IDX_CREATOR,
     IDX_LIKES, IDX_COLLECTS, IDX_SHARES, IDX_COMMENTS, IDX_DATE,
+    IDX_HASHTAGS, extract_hashtags,
 )
 from feishu_utils import append_rows, write_cells, write_row_fields, get_last_row
 
@@ -135,9 +136,12 @@ def cmd_crawl(args):
 # ==================== 导入飞书 ====================
 
 def crawled_item_to_row(item: dict) -> list:
-    """将 MediaCrawler 输出的一条数据转为 18 列行数组。"""
-    row = [""] * 18
-    row[IDX_TITLE] = item.get("title", "") or item.get("desc", "")
+    """将 MediaCrawler 输出的一条数据转为 19 列行数组。"""
+    row = [""] * 19
+    raw_title = item.get("title", "") or item.get("desc", "")
+    # 从标题中剥离 #标签
+    clean_title, hashtags = extract_hashtags(raw_title)
+    row[IDX_TITLE] = clean_title
     row[IDX_PLATFORM] = "抖音"
     row[IDX_URL] = item.get("aweme_url", "")
     row[IDX_CREATOR] = item.get("nickname", "")
@@ -146,6 +150,7 @@ def crawled_item_to_row(item: dict) -> list:
     row[IDX_SHARES] = item.get("share_count", "")
     row[IDX_COMMENTS] = item.get("comment_count", "")
     row[IDX_DATE] = str(date.today())
+    row[IDX_HASHTAGS] = ", ".join(hashtags) if hashtags else ""
     return row
 
 
@@ -228,13 +233,22 @@ def cmd_process(args):
 
         row_num = info["row"]
         video_url = info["video_url"]
-        title = info.get("title", "")
+        raw_title = info.get("title", "")
         desc = info.get("desc", "")
 
-        print(f"\n{'='*60}")
-        print(f"[处理 {count}/{min(limit, len(pending))}] 行{row_num}: {title[:50]}...")
-
+        # 从标题中剥离 #标签
+        clean_title, hashtags = extract_hashtags(raw_title)
         field_values = {}
+        if hashtags:
+            field_values[IDX_TITLE] = clean_title
+            field_values[IDX_HASHTAGS] = ", ".join(hashtags)
+
+        print(f"\n{'='*60}")
+        print(f"[处理 {count}/{min(limit, len(pending))}] 行{row_num}: {clean_title[:50]}...")
+        if hashtags:
+            print(f"[标签] {', '.join(hashtags)}")
+
+        title = clean_title  # AI分类用清理后的标题
 
         # Step 1: 视频转写
         if not info.get("transcript"):
