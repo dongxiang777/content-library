@@ -1,31 +1,14 @@
 #!/usr/bin/env python3
 """
-爆款内容库 Pipeline - 采集→导入→转写→AI分类→写回飞书
+爆款内容库 Pipeline - 采集→转写→分类→写入飞书
 
 用法:
-    # 1. 搜索采集
-    python pipeline.py crawl --keywords "遗嘱怎么写,立遗嘱" --count 10
-
-    # 2. 导入到飞书 (仅基础字段)
-    python pipeline.py import --file data/douyin/json/search_contents_2026-07-18.json
-
-    # 3. 处理已导入条目 (转写+AI分类+回写)
-    python pipeline.py process --state data/pipeline_state.json
-
-    # 4. 完整流程 (采集→导入→处理)
+    python pipeline.py crawl --keywords "遗嘱怎么写" --count 10
+    python pipeline.py import --file <json> [--count N]   # 转写+分类+一次性写入
     python pipeline.py full --keywords "遗嘱怎么写" --count 5
-
-    # 5. 用户主页采集
+    python pipeline.py process [--limit N]                # 重试无文案的行
     python pipeline.py crawl --type creator --creator-id "MS4wLjABAAA..."
-
-    # 6. 单独转写一个视频
-    python pipeline.py transcribe --url "https://www.douyin.com/aweme/v1/play/..."
-
-环境要求:
-    - lark-cli 已安装且已认证
-    - MediaCrawler 在 tools/MediaCrawler/ 且 .venv 已配置
-    - ffmpeg 已安装
-    - FunASR 已安装在 MediaCrawler .venv 中
+    python pipeline.py transcribe --url "https://..."
 """
 
 import argparse
@@ -34,48 +17,83 @@ import os
 import subprocess
 import sys
 import time
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 
-# 确保能导入同目录模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (
     SPREADSHEET_TOKEN, SHEET_ID, MEDIACRAWLER_DIR, VENV_PYTHON,
-    DATA_DIR, FIELDS,
-    IDX_BIZ, IDX_SUB, IDX_FORM, IDX_TOPIC, IDX_ANGLE,
-    IDX_AUDIENCE, IDX_EMOTION, IDX_TAGS, IDX_TRANSCRIPT,
-    IDX_TITLE, IDX_PLATFORM, IDX_URL, IDX_CREATOR,
-    IDX_LIKES, IDX_COLLECTS, IDX_SHARES, IDX_COMMENTS, IDX_DATE,
-    IDX_HASHTAGS, extract_hashtags,
+    DATA_DIR, FIELD_NAMES, extract_hashtags,
 )
-from feishu_utils import append_rows, write_cells, write_row_fields, get_last_row
+from feishu_utils import (
+    append_rows, write_row_fields, get_last_row, get_column_map, _col_letter,
+)
 
 
 # ==================== 状态管理 ====================
 
 def load_state(path: str) -> dict:
-    """加载 pipeline 状态文件。"""
     if Path(path).exists():
-        with open(path) as f:
-            return json.load(f)
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"[警告] 状态文件损坏，从空白状态开始: {e}")
     return {"items": {}, "last_import_row": 0}
 
 
 def save_state(state: dict, path: str):
-    """保存 pipeline 状态文件。"""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, 'w') as f:
+    tmp = path + ".tmp"
+    with open(tmp, 'w') as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
 
 DEFAULT_STATE = f"{DATA_DIR}/pipeline_state.json"
 
 
+# ==================== 行数据构建 (按列名，不依赖位置) ====================
+
+def build_row_data(item: dict, transcript: str = "", classification: dict = None,
+                   platform: str = "抖音") -> dict:
+    """
+    构建完整行数据 dict，key 是列名。
+    传入 get_column_map() 后就知道写到哪一列，列顺序变了也不用改代码。
+    """
+    raw_title = item.get("title", "") or item.get("desc", "")
+    clean_title, hashtags = extract_hashtags(raw_title)
+
+    data = {}
+    data["标题"] = clean_title
+    data["平台"] = platform
+    data["原始链接"] = item.get("aweme_url", "")
+    data["创作者"] = item.get("nickname", "")
+    data["点赞"] = item.get("liked_count", "")
+    data["收藏"] = item.get("collected_count", "")
+    data["转发"] = item.get("share_count", "")
+    data["评论"] = item.get("comment_count", "")
+    data["入库日期"] = str(date.today())
+    data["原视频标签"] = ", ".join(hashtags) if hashtags else ""
+
+    if transcript:
+        data["文案全文"] = transcript
+
+    if classification:
+        for field_name in ["业务方向", "细分领域", "内容形式", "选题方向",
+                           "内容切入角度", "目标人群", "情绪钩子", "特征标签"]:
+            val = classification.get(field_name, "")
+            if val:
+                data[field_name] = val
+
+    return data
+
+
 # ==================== 采集 ====================
 
 def cmd_crawl(args):
-    """运行 MediaCrawler 采集抖音视频。"""
+    """运行 MediaCrawler 采集抖音视频，返回 JSON 文件路径。"""
     crawl_type = args.type
     output_dir = f"{MEDIACRAWLER_DIR}/data/douyin/json"
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -91,7 +109,7 @@ def cmd_crawl(args):
                 "--crawler_max_notes_count", str(args.count)]
     elif crawl_type == "creator":
         if not args.creator_id:
-            print("主页采集需要 --creator_id 参数 (sec_uid 或主页 URL)")
+            print("主页采集需要 --creator_id 参数")
             sys.exit(1)
         cmd += ["--type", "creator",
                 "--creator_id", args.creator_id]
@@ -106,22 +124,18 @@ def cmd_crawl(args):
 
     print(f"[采集] cd {MEDIACRAWLER_DIR} && {' '.join(cmd)}")
 
-    # 清除代理（MediaCrawler 的 Playwright 需要直连）
     env = os.environ.copy()
     for var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]:
         env.pop(var, None)
 
-    result = subprocess.run(
-        cmd, cwd=MEDIACRAWLER_DIR, env=env,
-        capture_output=False,  # 让 MediaCrawler 输出到终端
-    )
+    result = subprocess.run(cmd, cwd=MEDIACRAWLER_DIR, env=env)
 
     if result.returncode != 0:
         print(f"[采集] 退出码: {result.returncode}")
         sys.exit(1)
 
-    # 找到最新的 JSON 文件
-    json_files = sorted(Path(output_dir).glob("*.json"), key=os.path.getmtime, reverse=True)
+    json_files = sorted(Path(output_dir).glob("*.json"),
+                        key=os.path.getmtime, reverse=True)
     if json_files:
         print(f"\n[采集] 输出文件: {json_files[0]}")
         with open(json_files[0]) as f:
@@ -133,99 +147,193 @@ def cmd_crawl(args):
         return None
 
 
-# ==================== 导入飞书 ====================
-
-def crawled_item_to_row(item: dict) -> list:
-    """将 MediaCrawler 输出的一条数据转为 19 列行数组。"""
-    row = [""] * 19
-    raw_title = item.get("title", "") or item.get("desc", "")
-    # 从标题中剥离 #标签
-    clean_title, hashtags = extract_hashtags(raw_title)
-    row[IDX_TITLE] = clean_title
-    row[IDX_PLATFORM] = "抖音"
-    row[IDX_URL] = item.get("aweme_url", "")
-    row[IDX_CREATOR] = item.get("nickname", "")
-    row[IDX_LIKES] = item.get("liked_count", "")
-    row[IDX_COLLECTS] = item.get("collected_count", "")
-    row[IDX_SHARES] = item.get("share_count", "")
-    row[IDX_COMMENTS] = item.get("comment_count", "")
-    row[IDX_DATE] = str(date.today())
-    row[IDX_HASHTAGS] = ", ".join(hashtags) if hashtags else ""
-    return row
-
+# ==================== 导入 (先转写，再一次性写入) ====================
 
 def cmd_import(args):
-    """将采集的 JSON 导入飞书表格（仅基础字段）。"""
+    """
+    导入流程：
+    1. 读取采集 JSON，去重
+    2. 逐条：下载视频 → 转写文案 → AI分类
+    3. 全部完成后一次性写入飞书（每行都是完整的，含文案和分类）
+    """
     with open(args.file) as f:
         items = json.load(f)
 
-    print(f"[导入] 读取 {len(items)} 条数据，从 {args.file}")
+    print(f"[导入] 读取 {len(items)} 条数据")
 
     state = load_state(args.state)
 
-    # 获取当前最后一行
-    last_row = get_last_row()
-    print(f"[导入] 飞书表格当前最后一行: {last_row}")
+    # 动态读取飞书列映射（不再硬编码列位置）
+    col_map = get_column_map()
+    print(f"[导入] 飞书列映射: {len(col_map)}列")
 
-    # 去重：跳过已导入的 aweme_id
+    last_row = get_last_row()
+    print(f"[导入] 当前最后一行: {last_row}")
+
+    # 去重
     existing_ids = set(state.get("items", {}).keys())
-    new_items = [item for item in items
-                 if item.get("aweme_id") not in existing_ids]
+    new_items = [it for it in items if it.get("aweme_id") not in existing_ids]
     skipped = len(items) - len(new_items)
     if skipped:
         print(f"[导入] 跳过 {skipped} 条重复数据")
     if not new_items:
-        print("[导入] 没有新数据需要导入")
+        print("[导入] 没有新数据")
         return state
 
-    # 批量追加
-    rows = [crawled_item_to_row(item) for item in new_items]
-    resp = append_rows(SPREADSHEET_TOKEN, SHEET_ID, rows)
-    start_row = last_row + 1
-    print(f"[导入] 追加成功: 行 {start_row} ~ {start_row + len(rows) - 1}")
+    count = args.count if hasattr(args, 'count') and args.count else len(new_items)
+    new_items = new_items[:count]
 
-    # 记录状态 (aweme_id → 飞书行号)
-    for i, item in enumerate(new_items):
-        aweme_id = item.get("aweme_id", f"unknown_{i}")
-        state["items"][aweme_id] = {
-            "row": start_row + i,
-            "video_url": item.get("video_download_url", ""),
-            "title": item.get("title", ""),
-            "desc": item.get("desc", ""),
-            "processed": False,
-        }
+    # 延迟导入（只在需要时加载）
+    from transcribe import process_video, stop_daemon
+    from ai_classify import classify_item
 
-    state["last_import_row"] = start_row + len(rows) - 1
-    save_state(state, args.state)
-    print(f"[导入] 状态已保存到 {args.state}")
+    success = 0
+    next_row = last_row + 1
+
+    try:
+        for i, item in enumerate(new_items):
+            aweme_id = item.get("aweme_id") or f"unknown_{i}"
+            raw_title = item.get("title", "") or item.get("desc", "")
+            clean_title, hashtags = extract_hashtags(raw_title)
+
+            print(f"\n{'='*60}")
+            print(f"[导入 {i+1}/{len(new_items)}] 行{next_row}: {clean_title[:50]}...")
+            if hashtags:
+                print(f"[标签] {', '.join(hashtags)}")
+
+            # Step 1: 转写
+            video_url = item.get("video_download_url", "")
+            transcript = ""
+            if video_url:
+                try:
+                    vr = process_video(video_url)
+                    transcript = vr.get("transcript", "")
+                    if transcript:
+                        print(f"[转写] {len(transcript)}字")
+                    else:
+                        print("[转写] 无结果")
+                except Exception as e:
+                    print(f"[转写] 失败: {e}")
+            else:
+                print("[转写] 无视频URL，跳过")
+
+            # Step 2: 分类（必须有文案才分类）
+            classification = None
+            if transcript:
+                try:
+                    classification = classify_item(
+                        title=clean_title,
+                        desc=item.get("desc", ""),
+                        transcript=transcript,
+                    )
+                    if classification and classification.get("业务方向"):
+                        print(f"[分类] {classification['业务方向']}")
+                except Exception as e:
+                    print(f"[分类] 异常: {e}")
+
+            # Step 3: 构建完整行数据并立即写入飞书
+            row_data = build_row_data(item, transcript, classification)
+            num_cols = max(col_map.values()) + 1
+            row_arr = [""] * num_cols
+            for field_name, value in row_data.items():
+                idx = col_map.get(field_name)
+                if idx is not None:
+                    row_arr[idx] = value
+
+            write_ok = False
+            try:
+                append_rows(SPREADSHEET_TOKEN, SHEET_ID, [row_arr])
+                print(f"[写入] 行{next_row} 已写入飞书 ({len(row_data)}个字段)")
+                write_ok = True
+            except Exception as e:
+                print(f"[写入] 行{next_row} 写入失败: {e}")
+
+            # 只有写入成功才标记完成，否则下次 process 可以重试
+            state["items"][aweme_id] = {
+                "row": next_row if write_ok else 0,
+                "video_url": video_url,
+                "title": raw_title,
+                "desc": item.get("desc", ""),
+                "transcript": transcript,
+                "classified": classification is not None,
+                "processed": write_ok and bool(transcript),
+            }
+            if write_ok:
+                state["last_import_row"] = next_row
+                next_row += 1
+                if transcript:
+                    success += 1
+            else:
+                print(f"[警告] 行未写入，下次 process 命令会重试")
+
+            # 每条写完就保存状态（防中断丢失）
+            save_state(state, args.state)
+            time.sleep(0.5)
+
+    finally:
+        stop_daemon()
+
+    print(f"\n[导入] 完成: {success}/{len(new_items)} 条有文案")
     return state
 
 
-# ==================== 处理 (转写+AI分类+回写) ====================
+# ==================== 重试 (补转无文案的行) ====================
 
 def cmd_process(args):
-    """处理已导入的条目: 下载视频→转写→AI分类→回写飞书。"""
+    """
+    重试无文案的条目：
+    - 优先从 state 文件找 processed=false 的项
+    - 如果 state 没有待处理项，则扫飞书表格找有链接但无文案的行
+    """
     state = load_state(args.state)
-    items = state.get("items", {})
 
-    # 过滤待处理项
+    # 动态列映射
+    col_map = get_column_map()
+
+    # 1. 先从 state 找
+    items = state.get("items", {})
     pending = {k: v for k, v in items.items()
                if not v.get("processed") and v.get("video_url")}
 
+    # 2. state 没有就扫飞书表格
     if not pending:
-        print("[处理] 没有待处理的条目")
+        print("[处理] state 中无待处理项，扫描飞书表格...")
+        last_row = get_last_row()
+        if last_row > 1:
+            all_rows = read_sheet_safe(f"A1:{_col_letter(max(col_map.values()))}{last_row}")
+            if all_rows and len(all_rows) > 1:
+                header = all_rows[0]
+                url_col = col_map.get("原始链接")
+                transcript_col = col_map.get("文案全文")
+                title_col = col_map.get("标题")
+
+                for r_idx, row in enumerate(all_rows[1:], start=2):
+                    while len(row) <= max(url_col or 0, transcript_col or 0, title_col or 0):
+                        row.append("")
+
+                    url = str(row[url_col]) if url_col is not None and row[url_col] else ""
+                    has_text = transcript_col is not None and row[transcript_col]
+                    title = str(row[title_col]) if title_col is not None and row[title_col] else ""
+
+                    if url and not has_text:
+                        pending[f"row_{r_idx}"] = {
+                            "row": r_idx,
+                            "video_url": url,
+                            "title": title,
+                            "transcript": "",
+                        }
+
+    if not pending:
+        print("[处理] 没有需要重试的条目")
         return
 
-    print(f"[处理] 共 {len(pending)} 条待处理")
+    limit = args.limit if hasattr(args, 'limit') and args.limit else len(pending)
+    print(f"[处理] 共 {len(pending)} 条待处理，本次处理 {min(limit, len(pending))} 条")
 
-    # 懒加载 FunASR 模型（只在第一次使用时加载）
-    from transcribe import process_video
+    from transcribe import process_video, stop_daemon
     from ai_classify import classify_item
 
-    # 如果有 --limit 参数
-    limit = args.limit if hasattr(args, 'limit') and args.limit else len(pending)
     count = 0
-
     for aweme_id, info in pending.items():
         if count >= limit:
             break
@@ -234,119 +342,97 @@ def cmd_process(args):
         row_num = info["row"]
         video_url = info["video_url"]
         raw_title = info.get("title", "")
-        desc = info.get("desc", "")
-
-        # 从标题中剥离 #标签
         clean_title, hashtags = extract_hashtags(raw_title)
-        field_values = {}
-        if hashtags:
-            field_values[IDX_TITLE] = clean_title
-            field_values[IDX_HASHTAGS] = ", ".join(hashtags)
 
         print(f"\n{'='*60}")
         print(f"[处理 {count}/{min(limit, len(pending))}] 行{row_num}: {clean_title[:50]}...")
+
+        field_values = {}
         if hashtags:
-            print(f"[标签] {', '.join(hashtags)}")
+            field_values["标题"] = clean_title
+            field_values["原视频标签"] = ", ".join(hashtags)
 
-        title = clean_title  # AI分类用清理后的标题
-
-        # Step 1: 视频转写
-        if not info.get("transcript"):
+        # 转写
+        transcript = info.get("transcript", "")
+        if not transcript and video_url:
             try:
                 vr = process_video(video_url)
                 transcript = vr.get("transcript", "")
-                # 清理 FunASR 版本号前缀
-                for prefix in ["funasr version: 1.3.16.", "funasr version:", "FunASR version:"]:
-                    if transcript.startswith(prefix):
-                        transcript = transcript[len(prefix):].lstrip("\n ")
-                        break
                 if transcript:
-                    field_values[IDX_TRANSCRIPT] = transcript
+                    field_values["文案全文"] = transcript
                     info["transcript"] = transcript
-                    print(f"[处理] 转写完成: {len(transcript)}字")
+                    print(f"[转写] {len(transcript)}字")
                 else:
-                    print("[处理] 转写无结果，跳过本条")
+                    print("[转写] 无结果")
             except Exception as e:
-                print(f"[处理] 转写失败: {e}")
-                transcript = ""
-        else:
-            transcript = info["transcript"]
-            print(f"[处理] 已有转写 ({len(transcript)}字)")
+                print(f"[转写] 失败: {e}")
 
-        # 没有文案就不分类，避免凭空瞎写
         if not transcript:
-            print("[处理] 无文案，不分类、不标记完成，等待重试")
+            print("[处理] 无文案，跳过")
             save_state(state, args.state)
-            time.sleep(1)
             continue
 
-        # Step 2: AI 分类
+        # 分类
         if not info.get("classified"):
             try:
-                classification = classify_item(
-                    title=title, desc=desc, transcript=transcript
+                cls = classify_item(
+                    title=clean_title,
+                    desc=info.get("desc", ""),
+                    transcript=transcript,
                 )
-                if classification:
-                    # 映射分类结果到列索引
-                    field_map = {
-                        "业务方向": IDX_BIZ, "细分领域": IDX_SUB,
-                        "内容形式": IDX_FORM, "选题方向": IDX_TOPIC,
-                        "内容切入角度": IDX_ANGLE, "目标人群": IDX_AUDIENCE,
-                        "情绪钩子": IDX_EMOTION, "特征标签": IDX_TAGS,
-                    }
-                    for field_name, col_idx in field_map.items():
-                        val = classification.get(field_name, "")
+                if cls and cls.get("业务方向"):
+                    for fn in ["业务方向", "细分领域", "内容形式", "选题方向",
+                               "内容切入角度", "目标人群", "情绪钩子", "特征标签"]:
+                        val = cls.get(fn, "")
                         if val:
-                            field_values[col_idx] = val
+                            field_values[fn] = val
                     info["classified"] = True
-                    print(f"[处理] AI分类完成: {classification.get('业务方向', '')}")
-                else:
-                    print("[处理] AI分类无结果 (LLM 不可用？)")
+                    print(f"[分类] {cls['业务方向']}")
             except Exception as e:
-                print(f"[处理] AI分类异常: {e}")
+                print(f"[分类] 异常: {e}")
 
-        # Step 3: 回写飞书
+        # 写回飞书
         if field_values:
             try:
-                write_row_fields(SPREADSHEET_TOKEN, SHEET_ID, row_num, field_values)
-                print(f"[处理] 已回写飞书行{row_num}: {len(field_values)}个字段")
+                write_row_fields(SPREADSHEET_TOKEN, SHEET_ID, row_num,
+                                 field_values, col_map)
+                print(f"[处理] 已写入行{row_num}: {len(field_values)}个字段")
             except Exception as e:
-                print(f"[处理] 回写飞书失败: {e}")
-        else:
-            print("[处理] 无新字段需要回写")
+                print(f"[处理] 写入失败: {e}")
 
-        # 标记已处理
         info["processed"] = True
         save_state(state, args.state)
-
-        # 避免请求过快
         time.sleep(1)
 
-    print(f"\n[处理] 完成，共处理 {count} 条")
+    stop_daemon()
+    print(f"\n[处理] 完成，处理了 {count} 条")
+
+
+def read_sheet_safe(range_str: str) -> list:
+    """安全读取飞书表格，出错返回空列表。"""
+    try:
+        from feishu_utils import read_sheet
+        return read_sheet(range_str)
+    except Exception as e:
+        print(f"[警告] 读取飞书表格失败: {e}")
+        return []
 
 
 # ==================== 完整流程 ====================
 
 def cmd_full(args):
-    """完整流程: 采集 → 导入 → 处理。"""
-    # Step 1: 采集
+    """完整流程: 采集 → 转写+分类 → 写入飞书。"""
     print("=" * 60)
-    print("[Full] Step 1/3: 采集")
+    print("[Full] Step 1/2: 采集")
     json_file = cmd_crawl(args)
     if not json_file:
         print("[Full] 采集失败，终止")
         return
 
-    # Step 2: 导入
     print("\n" + "=" * 60)
-    print("[Full] Step 2/3: 导入飞书")
+    print("[Full] Step 2/2: 转写+分类+写入飞书")
     args.file = json_file
-    state = cmd_import(args)
-
-    # Step 3: 处理
-    print("\n" + "=" * 60)
-    print("[Full] Step 3/3: 转写+AI分类+回写")
-    cmd_process(args)
+    cmd_import(args)
 
     print("\n" + "=" * 60)
     print("[Full] 全部完成!")
@@ -355,13 +441,13 @@ def cmd_full(args):
 # ==================== 单独转写 ====================
 
 def cmd_transcribe(args):
-    """单独转写一个视频。"""
-    from transcribe import process_video
+    from transcribe import process_video, stop_daemon
     result = process_video(args.url)
     if result["success"]:
         print(f"\n--- 转写结果 ---\n{result['transcript']}")
     else:
         print("[转写] 失败")
+    stop_daemon()
 
 
 # ==================== 入口 ====================
@@ -373,50 +459,41 @@ def main():
         epilog="""
 示例:
   %(prog)s crawl --keywords "遗嘱怎么写,立遗嘱" --count 10
-  %(prog)s import --file data/douyin/json/search_contents_2026-07-18.json
-  %(prog)s process --state data/pipeline_state.json --limit 5
+  %(prog)s import --file data/douyin/json/search_contents_2026-07-18.json --count 5
   %(prog)s full --keywords "遗嘱怎么写" --count 5
+  %(prog)s process --limit 5
   %(prog)s crawl --type creator --creator-id "MS4wLjABAAA..."
   %(prog)s transcribe --url "https://..."
         """
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # crawl
     p_crawl = sub.add_parser("crawl", help="采集抖音视频")
     p_crawl.add_argument("--type", choices=["search", "creator"], default="search")
     p_crawl.add_argument("--keywords", help="搜索关键词，逗号分隔")
-    p_crawl.add_argument("--creator-id", help="创作者 sec_uid 或主页 URL (creator 模式)")
+    p_crawl.add_argument("--creator-id", help="创作者 sec_uid 或主页 URL")
     p_crawl.add_argument("--count", type=int, default=10, help="最大采集数")
 
-    # import
-    p_import = sub.add_parser("import", help="导入采集数据到飞书")
+    p_import = sub.add_parser("import", help="转写+分类+写入飞书")
     p_import.add_argument("--file", required=True, help="MediaCrawler 输出的 JSON 文件")
     p_import.add_argument("--state", default=DEFAULT_STATE, help="状态文件路径")
+    p_import.add_argument("--count", type=int, help="最多处理条数")
 
-    # process
-    p_process = sub.add_parser("process", help="处理已导入条目 (转写+AI分类+回写)")
+    p_process = sub.add_parser("process", help="重试无文案的行")
     p_process.add_argument("--state", default=DEFAULT_STATE, help="状态文件路径")
     p_process.add_argument("--limit", type=int, help="最多处理条数")
-    p_process.add_argument("--no-transcribe", action="store_true", help="跳过转写 (仅AI分类)")
-    p_process.add_argument("--no-classify", action="store_true", help="跳过AI分类 (仅转写)")
 
-    # full
-    p_full = sub.add_parser("full", help="完整流程: 采集→导入→处理")
+    p_full = sub.add_parser("full", help="完整流程: 采集→转写→写入")
     p_full.add_argument("--type", choices=["search", "creator"], default="search")
     p_full.add_argument("--keywords", help="搜索关键词")
     p_full.add_argument("--creator-id", help="创作者 sec_uid 或主页 URL")
     p_full.add_argument("--count", type=int, default=10)
     p_full.add_argument("--state", default=DEFAULT_STATE)
-    p_full.add_argument("--limit", type=int, help="最多处理条数")
 
-    # transcribe
     p_trans = sub.add_parser("transcribe", help="单独转写一个视频")
     p_trans.add_argument("--url", required=True, help="视频下载 URL")
 
     args = parser.parse_args()
-
-    # 确保 data 目录存在
     Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 
     cmds = {

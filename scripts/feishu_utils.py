@@ -18,7 +18,6 @@ try:
     import certifi
     _SSL_CTX.load_verify_locations(certifi.where())
 except ImportError:
-    # Homebrew Python: 直接加载 macOS 系统证书包
     _SSL_CTX.load_verify_locations("/etc/ssl/cert.pem")
 
 # 飞书是国内站，直连不需要代理。代理会劫持 HTTPS 导致证书验证失败。
@@ -26,7 +25,6 @@ _PROXY_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_pr
 _saved_proxy = {}
 
 def _unset_proxy():
-    """临时清除代理环境变量，返回被清除的值以便恢复。"""
     global _saved_proxy
     _saved_proxy = {}
     for k in _PROXY_KEYS:
@@ -35,53 +33,28 @@ def _unset_proxy():
             _saved_proxy[k] = v
 
 def _restore_proxy():
-    """恢复之前清除的代理环境变量。"""
     os.environ.update(_saved_proxy)
 
 from config import SPREADSHEET_TOKEN, SHEET_ID
 
 # ===== 飞书应用凭证 =====
-# 优先从环境变量读取，其次从项目 .env 文件读取
 _FEISHU_BASE = "https://open.feishu.cn"
 _TOKEN_CACHE = {"token": None, "expires_at": 0}
 
 
-def _load_env_file():
-    """从项目 .env 文件加载环境变量（不覆盖已有环境变量）。"""
-    env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
-    env_path = os.path.normpath(env_path)
-    if not os.path.isfile(env_path):
-        return
-    with open(env_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            key, val = key.strip(), val.strip().strip("'\"")
-            if key and key not in os.environ:
-                os.environ[key] = val
-
-
-_load_env_file()
-
-
 def _get_app_credentials() -> tuple:
-    """获取飞书应用的 app_id 和 app_secret。"""
     app_id = os.environ.get("FEISHU_APP_ID", "")
     app_secret = os.environ.get("FEISHU_APP_SECRET", "")
     if not app_id or not app_secret:
         raise RuntimeError(
             "缺少飞书应用凭证。请在环境变量或项目 .env 文件中设置:\n"
             "  FEISHU_APP_ID=cli_xxxxx\n"
-            "  FEISHU_APP_SECRET=xxxxx\n"
-            "获取方式：飞书开放平台 → 你的应用 → 凭证与基础信息"
+            "  FEISHU_APP_SECRET=xxxxx"
         )
     return app_id, app_secret
 
 
 def _get_tenant_token() -> str:
-    """获取 tenant_access_token（机器人令牌），自动缓存和刷新。"""
     now = time.time()
     if _TOKEN_CACHE["token"] and _TOKEN_CACHE["expires_at"] > now + 60:
         return _TOKEN_CACHE["token"]
@@ -104,7 +77,9 @@ def _get_tenant_token() -> str:
     if data.get("code") != 0:
         raise RuntimeError(f"获取 tenant_access_token 失败: {data.get('msg', data)}")
 
-    token = data["tenant_access_token"]
+    token = data.get("tenant_access_token")
+    if not token:
+        raise RuntimeError(f"获取 tenant_access_token 失败: 响应中缺少 token 字段")
     expire = data.get("expire", 7200)
     _TOKEN_CACHE["token"] = token
     _TOKEN_CACHE["expires_at"] = now + expire
@@ -112,8 +87,7 @@ def _get_tenant_token() -> str:
 
 
 def _http_request(method: str, path: str, body: Optional[dict] = None,
-                  timeout: int = 120) -> dict:
-    """发送飞书 API HTTP 请求。"""
+                  timeout: int = 30, max_retries: int = 3) -> dict:
     token = _get_tenant_token()
     url = f"{_FEISHU_BASE}{path}" if path.startswith("/") else path
 
@@ -126,25 +100,42 @@ def _http_request(method: str, path: str, body: Optional[dict] = None,
     if body is not None:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
 
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    last_err = None
+    for attempt in range(max_retries):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            _unset_proxy()
+            with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:
+                resp_body = resp.read().decode("utf-8")
+                if not resp_body:
+                    return {}
+                return json.loads(resp_body)
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")[:400]
+            if e.code == 429 or e.code >= 500:
+                # 可重试的瞬时错误，指数退避
+                wait = 2 ** attempt
+                print(f"[飞书] {method} {path} 返回 {e.code}，{wait}s 后重试 ({attempt+1}/{max_retries})")
+                last_err = e
+                time.sleep(wait)
+                continue
+            raise RuntimeError(
+                f"飞书 API {method} {path} 返回 {e.code}:\n{err_body}"
+            ) from e
+        except urllib.error.URLError as e:
+            # 网络错误（DNS/连接超时等），可重试
+            wait = 2 ** attempt
+            print(f"[飞书] 网络错误: {e.reason}，{wait}s 后重试 ({attempt+1}/{max_retries})")
+            last_err = e
+            time.sleep(wait)
+            continue
+        finally:
+            _restore_proxy()
 
-    try:
-        _unset_proxy()
-        with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:
-            resp_body = resp.read().decode("utf-8")
-            if not resp_body:
-                return {}
-            return json.loads(resp_body)
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")[:800]
-        raise RuntimeError(
-            f"飞书 API {method} {path} 返回 {e.code}:\n{err_body}"
-        ) from e
-    finally:
-        _restore_proxy()
+    raise RuntimeError(f"飞书 API {method} {path} 重试 {max_retries} 次后仍失败: {last_err}")
 
 
-# ===== 高层接口（与 pipeline.py 兼容，签名不变）=====
+# ===== 高层接口 =====
 
 
 def read_sheet(range_str: str, token: str = SPREADSHEET_TOKEN,
@@ -157,13 +148,70 @@ def read_sheet(range_str: str, token: str = SPREADSHEET_TOKEN,
     return data.get("data", {}).get("valueRange", {}).get("values", [])
 
 
+def get_column_map(token: str = SPREADSHEET_TOKEN,
+                   sheet_id: str = SHEET_ID) -> dict:
+    """
+    动态读取表头行，返回 {列名: 0-based索引}。
+    不再硬编码列位置 — 飞书表格里加列、调列顺序，代码自动适配。
+    """
+    from config import FIELD_NAMES
+    rows = read_sheet("A1:Z1", token, sheet_id)
+    if not rows:
+        raise RuntimeError("飞书表格为空或无法读取表头")
+    header = rows[0]
+
+    col_map = {}
+    for i, h in enumerate(header):
+        h_str = str(h).strip() if h else ""
+        if h_str:
+            col_map[h_str] = i
+
+    # 检查关键字段是否都在
+    missing = [f for f in FIELD_NAMES if f not in col_map]
+    if missing:
+        print(f"[警告] 飞书表格缺少以下列: {', '.join(missing)}")
+
+    return col_map
+
+
+def _col_letter(idx: int) -> str:
+    """将 0-based 列索引转为飞书列字母 (0→A, 25→Z, 26→AA, ...)。"""
+    result = ""
+    while True:
+        result = chr(ord("A") + idx % 26) + result
+        idx = idx // 26 - 1
+        if idx < 0:
+            break
+    return result
+
+
 def get_last_row(token: str = SPREADSHEET_TOKEN, sheet_id: str = SHEET_ID) -> int:
-    """获取表格当前最后一行行号（1-indexed）。"""
-    values = read_sheet("A1:R500", token, sheet_id)
-    # 从末尾去掉全空行
-    while values and not any(c for c in values[-1] if c):
-        values.pop()
-    return len(values)
+    """获取表格当前最后一行行号（1-indexed）。分页读取，不受 500 行限制。"""
+    batch = 500
+    offset = 0
+    while True:
+        start_letter = "A"
+        end_letter = "Z"
+        range_str = f"{start_letter}{offset + 1}:{end_letter}{offset + batch}"
+        values = read_sheet(range_str, token, sheet_id)
+        if not values:
+            return offset
+
+        # 找到这批数据中最后一条非空行
+        last_nonempty = -1
+        for i, row in enumerate(values):
+            if any(c for c in row if c):
+                last_nonempty = i
+
+        if last_nonempty >= 0:
+            # 这批有数据，可能还有更多
+            offset += last_nonempty + 1
+            # 如果不满一批，说明没有更多了
+            if len(values) < batch:
+                return offset
+        else:
+            # 这批全空，最后一行在上一批
+            return offset
 
 
 def write_cells(token: str, sheet_id: str, range_str: str, values: list) -> dict:
@@ -188,45 +236,42 @@ def append_rows(token: str, sheet_id: str, values: list) -> dict:
 
 
 def write_row_fields(token: str, sheet_id: str, row_num: int,
-                     field_values: dict) -> dict:
+                     field_values: dict, col_map: dict) -> dict:
     """
     写入某一行的指定字段。
-    field_values: {列索引(0-based): 值}，只写有值的列。
+    field_values: {列名(str): 值}，按列名定位，不依赖硬编码索引。
+    col_map: get_column_map() 的返回值。
     """
     if not field_values:
         return {}
 
-    cols = sorted(field_values.keys())
-    # 将连续列合并为 range 写入
-    groups = []
-    current_group = [cols[0]]
-    for c in cols[1:]:
-        if c == current_group[-1] + 1:
-            current_group.append(c)
-        else:
-            groups.append(current_group)
-            current_group = [c]
-    groups.append(current_group)
+    num_cols = max(col_map.values()) + 1
+    row = [""] * num_cols
 
-    results = {}
-    for group in groups:
-        start_col = chr(ord("A") + group[0])
-        end_col = chr(ord("A") + group[-1])
-        range_str = f"{start_col}{row_num}:{end_col}{row_num}"
-        vals = [[field_values[c] for c in group]]
-        resp = write_cells(token, sheet_id, range_str, vals)
-        results[range_str] = resp
+    for field_name, value in field_values.items():
+        idx = col_map.get(field_name)
+        if idx is not None:
+            row[idx] = value
 
-    return results
+    # 计算实际写入范围（找到首尾非空列）
+    non_empty = [i for i, v in enumerate(row) if v]
+    if not non_empty:
+        return {}
+
+    start = min(non_empty)
+    end = max(non_empty)
+    start_col = _col_letter(start)
+    end_col = _col_letter(end)
+    range_str = f"{start_col}{row_num}:{end_col}{row_num}"
+    vals = [row[start:end + 1]]
+
+    return write_cells(token, sheet_id, range_str, vals)
 
 
 if __name__ == "__main__":
-    # 快速测试
-    print("测试读取飞书表格...")
+    print("测试动态列映射...")
+    col_map = get_column_map()
+    print(f"列映射: {col_map}")
+    print(f"\n测试读取最后一行...")
     last = get_last_row()
     print(f"当前表格最后一行: {last}")
-    # 读取前两行验证
-    rows = read_sheet("A1:R2")
-    print(f"读取到 {len(rows)} 行")
-    if rows:
-        print(f"表头: {rows[0][:5]}...")

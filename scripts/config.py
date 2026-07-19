@@ -1,69 +1,19 @@
 """
 爆款内容库 Pipeline 配置
+列位置不再硬编码 — 运行时通过 feishu_utils.get_column_map() 读飞书表头动态获取。
 """
 
 # ===== 飞书表格 =====
 SPREADSHEET_TOKEN = "RwZFsg8klhpzWVtHrpUcnguAn4g"
 SHEET_ID = "3a6f67"
 
-# 19列字段定义 (A-S) — 与飞书表格实际列顺序一致
-FIELDS = [
-    "业务方向",     # A (0)
-    "细分领域",     # B (1)
-    "内容形式",     # C (2)
-    "选题方向",     # D (3)
-    "内容切入角度", # E (4)
-    "目标人群",     # F (5)
-    "情绪钩子",     # G (6)
-    "特征标签",     # H (7)
-    "文案全文",     # I (8)
-    "标题",         # J (9)
-    "平台",         # K (10)
-    "原视频标签",   # L (11)
-    "原始链接",     # M (12)
-    "创作者",       # N (13)
-    "点赞",         # O (14)
-    "收藏",         # P (15)
-    "转发",         # Q (16)
-    "评论",         # R (17)
-    "入库日期",     # S (18)
+# 字段名清单（顺序无关紧要，运行时按飞书表头匹配列位置）
+FIELD_NAMES = [
+    "业务方向", "细分领域", "内容形式", "选题方向", "内容切入角度",
+    "目标人群", "情绪钩子", "特征标签", "文案全文", "标题",
+    "平台", "原视频标签", "原始链接", "创作者",
+    "点赞", "收藏", "转发", "评论", "入库日期",
 ]
-
-# 字段索引快捷引用
-IDX_BIZ = 0       # 业务方向
-IDX_SUB = 1       # 细分领域
-IDX_FORM = 2      # 内容形式
-IDX_TOPIC = 3     # 选题方向
-IDX_ANGLE = 4     # 内容切入角度
-IDX_AUDIENCE = 5  # 目标人群
-IDX_EMOTION = 6   # 情绪钩子
-IDX_TAGS = 7      # 特征标签
-IDX_TRANSCRIPT = 8  # 文案全文
-IDX_TITLE = 9     # 标题
-IDX_PLATFORM = 10 # 平台
-IDX_HASHTAGS = 11 # 原视频标签
-IDX_URL = 12      # 原始链接
-IDX_CREATOR = 13  # 创作者
-IDX_LIKES = 14    # 点赞
-IDX_COLLECTS = 15 # 收藏
-IDX_SHARES = 16   # 转发
-IDX_COMMENTS = 17 # 评论
-IDX_DATE = 18     # 入库日期
-
-# ===== 标签提取工具 =====
-import re
-
-def extract_hashtags(text: str) -> tuple:
-    """从标题/描述中提取 #标签，返回 (清理后的文本, 标签列表)。
-    支持抖音和视频号格式：#标签 #标签 #标签#标签
-    """
-    if not text:
-        return "", []
-    # 匹配 # 后跟非空白字符（到下一个 # 或空格或字符串结尾）
-    tags = re.findall(r'#([^\s#]+)', text)
-    # 从文本中移除标签部分
-    cleaned = re.sub(r'\s*#[^\s#]+', '', text).strip()
-    return cleaned, tags
 
 # ===== MediaCrawler =====
 MEDIACRAWLER_DIR = "/Users/shaoxinjiang/CodexWorkspace/projects/content library/tools/MediaCrawler"
@@ -96,7 +46,6 @@ def _load_env():
 _load_env()
 
 # ===== AI 分类 LLM 配置 (OpenAI 兼容端点) =====
-# 可通过环境变量覆盖: LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
 LLM_BASE_URL = _os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1")
 LLM_API_KEY = _os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = _os.environ.get("LLM_MODEL", "deepseek-chat")
@@ -115,3 +64,16 @@ SEARCH_KEYWORDS = {
         "车险理赔", "保险拒赔", "农业保险", "交通事故理赔",
     ],
 }
+
+# ===== 标签提取工具 =====
+import re
+
+def extract_hashtags(text: str) -> tuple:
+    """从标题/描述中提取 #标签，返回 (清理后的文本, 标签列表)。
+    支持抖音和视频号格式：#标签 #标签 #标签#标签
+    """
+    if not text:
+        return "", []
+    tags = re.findall(r'#([^\s#]+)', text)
+    cleaned = re.sub(r'\s*#[^\s#]+', '', text).strip()
+    return cleaned, tags
