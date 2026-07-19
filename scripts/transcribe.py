@@ -12,6 +12,10 @@ import sys
 import time
 from pathlib import Path
 
+# 确保能导入同目录模块
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import VENV_PYTHON
+
 
 # 模型加载是重量级操作，用全局变量做单例
 _model = None
@@ -97,13 +101,29 @@ def extract_audio(video_path: str, audio_path: str) -> bool:
 
 
 def transcribe(audio_path: str) -> str:
-    """对音频文件执行语音识别，返回带标点的文本。"""
-    model = get_model()
+    """对音频文件执行语音识别，返回带标点的文本。
+    通过 subprocess 调用 venv Python 中的 _funasr_worker.py，避免系统 Python 缺少 funasr。
+    """
+    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_funasr_worker.py")
     print(f"[FunASR] 转写: {audio_path}")
     t0 = time.time()
-    result = model.generate(input=audio_path, batch_size_s=300)
+
+    # 用 venv Python 跑 worker
+    env = os.environ.copy()
+    for var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"]:
+        env.pop(var, None)
+
+    result = subprocess.run(
+        [VENV_PYTHON, worker, audio_path],
+        capture_output=True, text=True, env=env,
+        timeout=300,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"FunASR worker 失败: {result.stderr[:500]}")
+
     elapsed = time.time() - t0
-    text = result[0]["text"] if result else ""
+    text = result.stdout.strip()
     print(f"[FunASR] 转写完成 ({elapsed:.1f}s, {len(text)}字)")
     return text
 
