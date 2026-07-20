@@ -183,7 +183,9 @@ def _send_cmd(cmd: dict, timeout: int = 300) -> dict:
 
 
 def transcribe(audio_path: str) -> str:
-    """转写音频文件，返回文本。模型已常驻内存，通常几秒完成。线程安全。"""
+    """转写音频文件，返回文本。模型已常驻内存，通常几秒完成。线程安全。
+    支持说话人分离：多人视频返回带【说话人N】标签的分段文案。
+    """
     print(f"[FunASR] 转写: {audio_path}")
     t0 = time.time()
 
@@ -194,7 +196,9 @@ def transcribe(audio_path: str) -> str:
         raise RuntimeError(f"FunASR 转写失败: {resp.get('error', 'unknown')}")
 
     text = resp.get("text", "")
-    print(f"[FunASR] 转写完成 ({elapsed:.1f}s, {len(text)}字)")
+    speakers = resp.get("speakers", 1)
+    spk_note = f", {speakers}人对话" if speakers > 1 else ""
+    print(f"[FunASR] 转写完成 ({elapsed:.1f}s, {len(text)}字{spk_note})")
     return text
 
 

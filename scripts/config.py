@@ -5,7 +5,26 @@
 
 # ===== 飞书表格 =====
 SPREADSHEET_TOKEN = "RwZFsg8klhpzWVtHrpUcnguAn4g"
-SHEET_ID = "3a6f67"
+SHEET_ID = "3a6f67"  # 默认子表（传承 IP）
+
+# 业务方向 → 子表 sheet_id 映射
+SHEET_MAP = {
+    "传承": "3a6f67",       # 传承 IP
+    "情感": "sy4S58",       # 情感 IP
+    "理赔": "SEtYpj",       # 理赔
+}
+
+def resolve_sheet_id(business: str) -> str:
+    """根据业务方向字符串匹配对应子表 sheet_id。
+    匹配规则：业务方向包含关键词即命中（如 "情感老年IP" → 情感表）。
+    未匹配时回退到默认 SHEET_ID（传承）。
+    """
+    if not business:
+        return SHEET_ID
+    for keyword, sid in SHEET_MAP.items():
+        if keyword in business:
+            return sid
+    return SHEET_ID
 
 # 字段名清单（顺序无关紧要，运行时按飞书表头匹配列位置）
 FIELD_NAMES = [
@@ -45,6 +64,14 @@ def _load_env():
 
 _load_env()
 
+# ===== 视频号 (wx_video_download 本地服务) =====
+# 服务需已启动（默认 http://127.0.0.1:2022），微信侧 socket 需已初始化。
+CHANNELS_API_BASE = _os.environ.get("CHANNELS_API_BASE", "http://127.0.0.1:2022")
+# MITM 代理：finder.video.qq.com 解密下载（与 config.yaml proxy.port 一致）
+CHANNELS_PROXY = _os.environ.get("CHANNELS_PROXY", "http://127.0.0.1:2023")
+CHANNELS_DOWNLOAD_DIR = f"{DATA_DIR}/sph_videos"
+CHANNELS_STATE = f"{DATA_DIR}/channels_state.json"
+
 # ===== AI 分类 LLM 配置 (OpenAI 兼容端点) =====
 LLM_BASE_URL = _os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1")
 LLM_API_KEY = _os.environ.get("LLM_API_KEY", "")
@@ -77,9 +104,14 @@ import re
 def extract_hashtags(text: str) -> tuple:
     """从标题/描述中提取 #标签，返回 (清理后的文本, 标签列表)。
     支持抖音和视频号格式：#标签 #标签 #标签#标签
+
+    视频号搜索结果常带 HTML 高亮（<em class="highlight">…</em>），
+    必须先剥标签再提取，否则 hashtag 会被截断、标题残留碎片。
     """
     if not text:
         return "", []
+    # 清除 HTML 标签（搜索高亮等），避免污染标签与标题
+    text = re.sub(r'<[^>]+>', '', text)
     tags = re.findall(r'#([^\s#]+)', text)
     cleaned = re.sub(r'\s*#[^\s#]+', '', text).strip()
     return cleaned, tags
