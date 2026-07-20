@@ -1031,6 +1031,14 @@ def _ensure_in_download_dir(src: str, oid: str) -> str:
             import shutil
             shutil.copy2(src, dest)
             LOG.info("已复制到 %s (%.1fMB)", dest, os.path.getsize(dest) / 1024 / 1024)
+            # 复制成功后删除原始下载文件（视频号工具默认落到 ~/Downloads），
+            # 否则下载文件夹会越堆越多。仅删 CHANNELS_DOWNLOAD_DIR 之外的源（即确实发生了复制）。
+            try:
+                if os.path.isfile(dest) and os.path.getsize(dest) == os.path.getsize(src):
+                    os.remove(src)
+                    LOG.info("已删除原始下载文件 %s", src)
+            except OSError as rm_e:
+                LOG.warning("删除原始下载文件失败 %s: %s", src, rm_e)
         return dest
     except OSError as e:
         LOG.warning("复制到下载目录失败: %s", e)
