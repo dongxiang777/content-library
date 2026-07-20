@@ -1,0 +1,32 @@
+# 与 Vortex/Clash 共存：
+# - 系统代理使用选择性 PAC：仅微信/腾讯相关域名 -> 127.0.0.1:2023 (MITM)
+# - 其他流量经 upstreamProxy 回落到 Clash mixed-port（Chrome 正常上网）
+# - 若 Clash 抢回系统代理，下载器会自动恢复 PAC（不会把全局 HTTP 代理改成 2023）
+
+debug:
+  error: false
+  echolog: false
+
+api:
+  protocol: "http"
+  hostname: "127.0.0.1"
+  port: 2022
+
+proxy:
+  system: true
+  hostname: "127.0.0.1"
+  port: 2023
+  tun: false
+  skipInstallRootCert: false
+  # Vortex/mihomo mixed-port — PAC 非微信域名回落 + MITM 上游
+  upstreamProxy: "http://127.0.0.1:7897"
+
+download:
+  dir: "%UserDownloads%"
+  playDoneAudio: true
+
+channels:
+  disableLocationToHome: false
+
+mp:
+  enabled: false

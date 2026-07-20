@@ -1,0 +1,11 @@
+# 内容库 Pipeline 在 MediaCrawler 虚拟环境之外额外需要的依赖。
+# 安装方式（用 MediaCrawler 的 venv，见 setup_mac.sh / setup_windows.ps1）：
+#   pip install -r scripts/setup/requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#
+# 说明：
+# - funasr 会自动带入 torch / torchaudio / modelscope（约 2GB，首次安装较慢）
+# - 视频转文案用本地 FunASR 推理，零 API 成本，中文识别效果最佳
+
+funasr
+modelscope
+certifi

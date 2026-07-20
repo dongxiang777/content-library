@@ -34,17 +34,23 @@ FIELD_NAMES = [
     "点赞", "收藏", "转发", "评论", "入库日期",
 ]
 
-# ===== MediaCrawler =====
-MEDIACRAWLER_DIR = "/Users/shaoxinjiang/CodexWorkspace/projects/content library/tools/MediaCrawler"
-VENV_PYTHON = f"{MEDIACRAWLER_DIR}/.venv/bin/python"
+# ===== 项目路径（动态计算，跨电脑/跨平台可用，不写死绝对路径）=====
+import os as _os
 
-# ===== 项目路径 =====
-PROJECT_DIR = "/Users/shaoxinjiang/CodexWorkspace/projects/content library"
-DATA_DIR = f"{PROJECT_DIR}/data"
-SCRIPTS_DIR = f"{PROJECT_DIR}/scripts"
+# scripts/config.py 所在目录即 scripts/，上一级即项目根目录
+SCRIPTS_DIR = _os.path.dirname(_os.path.abspath(__file__))
+PROJECT_DIR = _os.path.dirname(SCRIPTS_DIR)
+DATA_DIR = _os.path.join(PROJECT_DIR, "data")
+
+# ===== MediaCrawler（抖音采集，需单独克隆到 tools/ 下）=====
+MEDIACRAWLER_DIR = _os.path.join(PROJECT_DIR, "tools", "MediaCrawler")
+# 整个项目复用 MediaCrawler 的虚拟环境（FunASR 也装在这里）。
+# Windows 的 venv 解释器在 Scripts\python.exe，macOS/Linux 在 bin/python。
+_VENV_BIN = "Scripts" if _os.name == "nt" else "bin"
+_PY_EXE = "python.exe" if _os.name == "nt" else "python"
+VENV_PYTHON = _os.path.join(MEDIACRAWLER_DIR, ".venv", _VENV_BIN, _PY_EXE)
 
 # ===== 加载项目 .env =====
-import os as _os
 
 def _load_env():
     """从项目 .env 文件加载环境变量（不覆盖已有）。"""
