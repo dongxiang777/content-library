@@ -35,6 +35,8 @@ fi
 echo ""
 echo "[2/7] 编译视频号下载工具..."
 bash "$ROOT/scripts/setup/build_tool.sh"
+echo "  检测系统代理并写入工具配置..."
+python3 "$ROOT/scripts/detect_proxy.py"
 
 # ---------- 3. 克隆 MediaCrawler（抖音采集）----------
 echo ""

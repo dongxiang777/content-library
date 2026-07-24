@@ -36,6 +36,8 @@ if (Get-Command go -ErrorAction SilentlyContinue) {
 # ---------- 2. 编译视频号下载工具 ----------
 Write-Host "`n[2/7] 编译视频号下载工具..."
 & "$ROOT\scripts\setup\build_tool.bat"
+Write-Host "  检测系统代理并写入工具配置..."
+python "$ROOT\scripts\detect_proxy.py"
 
 # ---------- 3. 克隆 MediaCrawler（抖音采集）----------
 Write-Host "`n[3/7] 检查抖音采集工具 MediaCrawler..."
