@@ -4,7 +4,7 @@
 """
 
 # ===== 飞书表格 =====
-SPREADSHEET_TOKEN = "RwZFsg8klhpzWVtHrpUcnguAn4g"
+SPREADSHEET_TOKEN = "HxHmsSRjrhqsPkt8gDEcUIL8nMc"  # 采集库
 SHEET_ID = "3a6f67"  # 默认子表（传承 IP）
 
 # 业务方向 → 子表 sheet_id 映射
