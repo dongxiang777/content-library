@@ -29,13 +29,16 @@ sys.stdout = io.StringIO()
 sys.stderr = io.StringIO()
 try:
     from funasr import AutoModel
-    model = AutoModel(
-        model="paraformer-zh",
-        vad_model="fsmn-vad",
-        punc_model="ct-punc",
-        spk_model="cam++",
-        disable_update=True,
-    )
+    model_kwargs = {
+        "model": "paraformer-zh",
+        "vad_model": "fsmn-vad",
+        "punc_model": "ct-punc",
+        "disable_update": True,
+    }
+    # 快速模式优先完成普通文案识别；说话人分离是可选的高耗时步骤。
+    if os.environ.get("FAST_TRANSCRIBE", "0") != "1":
+        model_kwargs["spk_model"] = "cam++"
+    model = AutoModel(**model_kwargs)
 finally:
     _load_stderr = sys.stderr.getvalue()
     sys.stdout = _real_stdout
